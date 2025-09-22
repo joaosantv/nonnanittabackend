@@ -9,10 +9,19 @@ const FileSync = require('lowdb/adapters/FileSync');
 const shortid = require('shortid');
 const TelegramBot = require('node-telegram-bot-api');
 const nodemailer = require('nodemailer');
+const cors = require('cors');
 
 // --- Configuração do App ---
 const app = express();
 const port = process.env.PORT || 3000;
+
+// --- Configuração do CORS ---
+// Permite que o nosso site (frontend) converse com o nosso servidor (backend)
+const corsOptions = {
+  origin: process.env.FRONTEND_URL || 'https://nonnanitta.netlify.app'
+};
+app.use(cors(corsOptions));
+
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -27,7 +36,8 @@ const LIMITE_DE_VAGAS = 10;
 // --- Telegram ---
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// polling: true é essencial para os botões interativos funcionarem
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true }); 
 
 // --- Email (Nodemailer) ---
 const transporter = nodemailer.createTransport({
@@ -41,31 +51,28 @@ const transporter = nodemailer.createTransport({
 });
 const EMAIL_FROM = process.env.EMAIL_FROM;
 
-// --- URL do Frontend ---
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://nonnanitta.netlify.app'; 
-
 // --- Rotas ---
 app.get('/', (req, res) => {
   res.send('Servidor da Nonnanitta Café está no ar!');
 });
 
-// Rota para RESERVAS
+// Rota para RESERVAS (ATUALIZADA para responder com JSON para o modal)
 app.post('/reservas', (req, res) => {
   const { 'Data da Reserva': dataReserva, 'Hora da Reserva': horaReserva, Nome, Telefone } = req.body;
   const reservasNoMesmoHorario = db.get('reservas').filter(r => r['Data da Reserva'] === dataReserva && r['Hora da Reserva'] === horaReserva && r.status !== 'Recusada').size().value();
 
   if (reservasNoMesmoHorario >= LIMITE_DE_VAGAS) {
-    return res.redirect(`${FRONTEND_URL}/#reservas?reserva=erro`);
+    console.log(`Reserva RECUSADA por limite de vagas para ${dataReserva} às ${horaReserva}.`);
+    return res.status(409).json({ message: 'Desculpe, não há mais vagas para este horário.' });
   }
 
   const novaReserva = { id: shortid.generate(), status: 'Pendente', ...req.body };
   db.get('reservas').push(novaReserva).write();
   console.log(`Reserva PENDENTE para ${Nome}.`);
-
+  
   const telefoneLimpo = Telefone.replace(/\D/g, '');
   const mensagemWhats = `Olá ${Nome}! Sobre sua reserva na Nonna Nita...`;
   const linkWhatsApp = `https://wa.me/55${telefoneLimpo}?text=${encodeURIComponent(mensagemWhats)}`;
-
   const mensagemTelegram = `*Nova Reserva Pendente!* 🕒\n\n*Nome:* ${Nome}\n*Telefone:* ${Telefone}\n*Data:* ${dataReserva} às ${horaReserva}\n*Pessoas:* ${novaReserva['Numero de Pessoas']}\n\n[➡️ Responder via WhatsApp](${linkWhatsApp})`;
     
   bot.sendMessage(String(CHAT_ID), mensagemTelegram, {
@@ -73,10 +80,10 @@ app.post('/reservas', (req, res) => {
     reply_markup: { inline_keyboard: [[{ text: '✅ Confirmar', callback_data: `reserva_confirmar_${novaReserva.id}` }, { text: '❌ Recusar', callback_data: `reserva_recusar_${novaReserva.id}` }]] }
   });
 
-  return res.redirect(`${FRONTEND_URL}/#reservas?reserva=sucesso`);
+  return res.status(200).json({ message: 'Solicitação de reserva enviada com sucesso!' });
 });
 
-// Rota para PEDIDOS
+// Rota para PEDIDOS (ATUALIZADA para responder com JSON para o modal)
 app.post('/pedidos', (req, res) => {
     const { Nome, Telefone } = req.body;
     const novoPedido = { id: shortid.generate(), status: 'Pendente', ...req.body };
@@ -86,14 +93,13 @@ app.post('/pedidos', (req, res) => {
     const telefoneLimpo = Telefone.replace(/\D/g, '');
     const mensagemWhats = `Olá ${Nome}! Sobre seu pedido na Nonna Nita...`;
     const linkWhatsApp = `https://wa.me/55${telefoneLimpo}?text=${encodeURIComponent(mensagemWhats)}`;
-
     const mensagemTelegram = `*Novo Pedido para Retirada!* 🛍️\n\n*Nome:* ${Nome}\n*Telefone:* ${Telefone}\n\n*Itens:*\n${novoPedido['Itens do Pedido']}\n\n*Total:* ${novoPedido['Total do Pedido']}\n\n[➡️ Responder via WhatsApp](${linkWhatsApp})`;
     bot.sendMessage(String(CHAT_ID), mensagemTelegram, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '✅ Confirmar', callback_data: `pedido_confirmar_${novoPedido.id}` }, { text: '❌ Recusar', callback_data: `pedido_recusar_${novoPedido.id}` }]] }
     });
 
-    return res.redirect(`${FRONTEND_URL}/#pedido?pedido=sucesso`);
+    return res.status(200).json({ message: 'Pedido enviado com sucesso!' });
 });
 
 
@@ -121,7 +127,7 @@ bot.on('callback_query', async (query) => {
     
     bot.editMessageText(textoEditado, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
 
-    if (item.Email) { // Apenas reservas terão e-mail
+    if (item.Email) {
         const assunto = `Sua ${tipo} na Nonna Nita foi ${novoStatus}!`;
         const mensagemEmail = novoStatus === 'Confirmado'
           ? `Olá ${item.Nome}, a sua ${tipo} para o dia ${item['Data da Reserva']} às ${item['Hora da Reserva']} foi CONFIRMADA! Estamos à sua espera.`
@@ -137,6 +143,7 @@ bot.on('callback_query', async (query) => {
     
     bot.answerCallbackQuery(query.id, { text: `${tipo.charAt(0).toUpperCase() + tipo.slice(1)} ${novoStatus}!` });
 });
+
 
 // --- Iniciar Servidor ---
 app.listen(port, () => {
