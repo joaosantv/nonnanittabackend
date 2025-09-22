@@ -1,125 +1,145 @@
-// --- Executa o código quando o HTML da página terminar de carregar ---
-document.addEventListener('DOMContentLoaded', () => {
+// --- Carregar variáveis de ambiente ---
+require('dotenv').config();
 
-    // --- LÓGICA DO MENU HAMBÚRGUER (TELEMÓVEL) ---
-    const hamburger = document.querySelector(".hamburger");
-    const navMenu = document.querySelector(".nav-menu");
+// --- Importações ---
+const express = require('express');
+const bodyParser = require('body-parser');
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
+const shortid = require('shortid');
+const TelegramBot = require('node-telegram-bot-api');
+const nodemailer = require('nodemailer');
 
-    if (hamburger && navMenu) {
-        // Alterna a classe 'active' para mostrar/esconder o menu ao clicar
-        hamburger.addEventListener("click", () => {
-            hamburger.classList.toggle("active");
-            navMenu.classList.toggle("active");
-        });
+// --- Configuração do App ---
+const app = express();
+const port = process.env.PORT || 3000;
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
 
-        // Fecha o menu quando um link é clicado
-        document.querySelectorAll(".nav-link").forEach(n => n.addEventListener("click", () => {
-            hamburger.classList.remove("active");
-            navMenu.classList.remove("active");
-        }));
-    }
+// --- Configuração do Banco de Dados ---
+const adapter = new FileSync('db.json');
+const db = low(adapter);
+db.defaults({ reservas: [], pedidos: [] }).write();
 
-    // --- LÓGICA DO CARRINHO DE COMPRAS ---
-    const carrinho = {}; // Objeto para guardar os itens: { id: { nome, preco, qtd }, ... }
-    const botoesAdicionar = document.querySelectorAll('.btn-add');
-    const carrinhoItemsContainer = document.getElementById('carrinho-items');
-    const carrinhoTotalEl = document.getElementById('carrinho-total-valor');
-    const carrinhoVazioEl = document.querySelector('.carrinho-vazio');
+// --- Limite de Vagas ---
+const LIMITE_DE_VAGAS = 10;
 
-    // Função para redesenhar o carrinho na tela
-    function atualizarCarrinho() {
-        if (!carrinhoItemsContainer || !carrinhoTotalEl) return;
+// --- Telegram ---
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-        carrinhoItemsContainer.innerHTML = ''; // Limpa a exibição atual
-        let total = 0;
-        let temItens = false;
+// --- Email (Nodemailer) ---
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: process.env.SMTP_SECURE === 'true',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+const EMAIL_FROM = process.env.EMAIL_FROM;
 
-        for (const id in carrinho) {
-            temItens = true;
-            const item = carrinho[id];
-            total += item.preco * item.qtd;
+// --- URL do Frontend ---
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://nonnanitta.netlify.app'; 
 
-            const itemDiv = document.createElement('div');
-            itemDiv.classList.add('carrinho-item');
-            itemDiv.innerHTML = `
-                <span>${item.qtd}x ${item.nome}</span>
-                <span>R$ ${(item.preco * item.qtd).toFixed(2).replace('.', ',')}</span>
-            `;
-            carrinhoItemsContainer.appendChild(itemDiv);
-        }
+// --- Rotas ---
+app.get('/', (req, res) => {
+  res.send('Servidor da Nonnanitta Café está no ar!');
+});
 
-        // Mostra ou esconde a mensagem "carrinho vazio"
-        if (carrinhoVazioEl) {
-            carrinhoVazioEl.style.display = temItens ? 'none' : 'block';
-        }
-        
-        carrinhoTotalEl.textContent = total.toFixed(2).replace('.', ',');
-    }
+// Rota para RESERVAS
+app.post('/reservas', (req, res) => {
+  const { 'Data da Reserva': dataReserva, 'Hora da Reserva': horaReserva, Nome, Telefone } = req.body;
+  const reservasNoMesmoHorario = db.get('reservas').filter(r => r['Data da Reserva'] === dataReserva && r['Hora da Reserva'] === horaReserva && r.status !== 'Recusada').size().value();
 
-    // Adiciona o evento de clique para cada botão "Adicionar" da galeria
-    botoesAdicionar.forEach(botao => {
-        botao.addEventListener('click', () => {
-            const id = botao.dataset.id;
-            const nome = botao.dataset.nome;
-            const preco = parseFloat(botao.dataset.preco);
+  if (reservasNoMesmoHorario >= LIMITE_DE_VAGAS) {
+    return res.redirect(`${FRONTEND_URL}/#reservas?reserva=erro`);
+  }
 
-            if (carrinho[id]) {
-                carrinho[id].qtd++; // Se o item já existe, só aumenta a quantidade
-            } else {
-                carrinho[id] = { nome, preco, qtd: 1 }; // Se não, adiciona o item
-            }
-            
-            console.log('Carrinho atualizado:', carrinho); // Para depuração
-            atualizarCarrinho(); // Redesenha o carrinho com o item novo
-        });
+  const novaReserva = { id: shortid.generate(), status: 'Pendente', ...req.body };
+  db.get('reservas').push(novaReserva).write();
+  console.log(`Reserva PENDENTE para ${Nome}.`);
+
+  const telefoneLimpo = Telefone.replace(/\D/g, '');
+  const mensagemWhats = `Olá ${Nome}! Sobre sua reserva na Nonna Nita...`;
+  const linkWhatsApp = `https://wa.me/55${telefoneLimpo}?text=${encodeURIComponent(mensagemWhats)}`;
+
+  const mensagemTelegram = `*Nova Reserva Pendente!* 🕒\n\n*Nome:* ${Nome}\n*Telefone:* ${Telefone}\n*Data:* ${dataReserva} às ${horaReserva}\n*Pessoas:* ${novaReserva['Numero de Pessoas']}\n\n[➡️ Responder via WhatsApp](${linkWhatsApp})`;
+    
+  bot.sendMessage(String(CHAT_ID), mensagemTelegram, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [[{ text: '✅ Confirmar', callback_data: `reserva_confirmar_${novaReserva.id}` }, { text: '❌ Recusar', callback_data: `reserva_recusar_${novaReserva.id}` }]] }
+  });
+
+  return res.redirect(`${FRONTEND_URL}/#reservas?reserva=sucesso`);
+});
+
+// Rota para PEDIDOS
+app.post('/pedidos', (req, res) => {
+    const { Nome, Telefone } = req.body;
+    const novoPedido = { id: shortid.generate(), status: 'Pendente', ...req.body };
+    db.get('pedidos').push(novoPedido).write();
+    console.log(`Pedido PENDENTE de ${Nome}.`);
+
+    const telefoneLimpo = Telefone.replace(/\D/g, '');
+    const mensagemWhats = `Olá ${Nome}! Sobre seu pedido na Nonna Nita...`;
+    const linkWhatsApp = `https://wa.me/55${telefoneLimpo}?text=${encodeURIComponent(mensagemWhats)}`;
+
+    const mensagemTelegram = `*Novo Pedido para Retirada!* 🛍️\n\n*Nome:* ${Nome}\n*Telefone:* ${Telefone}\n\n*Itens:*\n${novoPedido['Itens do Pedido']}\n\n*Total:* ${novoPedido['Total do Pedido']}\n\n[➡️ Responder via WhatsApp](${linkWhatsApp})`;
+    bot.sendMessage(String(CHAT_ID), mensagemTelegram, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '✅ Confirmar', callback_data: `pedido_confirmar_${novoPedido.id}` }, { text: '❌ Recusar', callback_data: `pedido_recusar_${novoPedido.id}` }]] }
     });
 
-    // --- LÓGICA PARA PREPARAR O FORMULÁRIO ANTES DO ENVIO ---
-    const formPedido = document.querySelector('.form-pedido');
-    if (formPedido) {
-        formPedido.addEventListener('submit', () => {
-            const itensPedidoInput = document.getElementById('itens-pedido');
-            const totalPedidoInput = document.getElementById('total-pedido');
+    return res.redirect(`${FRONTEND_URL}/#pedido?pedido=sucesso`);
+});
 
-            let itensTexto = '';
-            for (const id in carrinho) {
-                const item = carrinho[id];
-                itensTexto += `${item.qtd}x ${item.nome}\n`; // Cria a lista de itens
-            }
-            
-            // Coloca a lista de itens e o total nos campos escondidos do formulário
-            itensPedidoInput.value = itensTexto.trim();
-            totalPedidoInput.value = `R$ ${carrinhoTotalEl.textContent}`;
-        });
+
+// --- Handler dos botões no Telegram ---
+bot.on('callback_query', async (query) => {
+    const { data, message } = query;
+    const [tipo, acao, id] = data.split('_'); 
+    const collection = tipo === 'reserva' ? 'reservas' : 'pedidos';
+    const item = db.get(collection).find({ id }).value();
+
+    if (!item || item.status !== 'Pendente') {
+        return bot.answerCallbackQuery(query.id, { text: `Este ${tipo} já foi tratado.` });
     }
 
-    // --- LÓGICA PARA MOSTRAR FEEDBACK VINDO DO BACKEND ---
-    function mostrarFeedback() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const feedbackReserva = urlParams.get('reserva');
-        const feedbackPedido = urlParams.get('pedido');
+    const novoStatus = (acao === 'confirmar') ? 'Confirmado' : 'Recusado';
+    db.get(collection).find({ id }).assign({ status: novoStatus }).write();
+
+    const emoji = novoStatus === 'Confirmado' ? '✅' : '❌';
+    let textoEditado = `*${tipo.toUpperCase()} ${novoStatus.toUpperCase()}!* ${emoji}\n\n*Cliente:* ${item.Nome}`;
+    
+    const telefoneLimpo = item.Telefone.replace(/\D/g, '');
+    const msgWhats = `Olá ${item.Nome}! O seu ${tipo} na Nonna Nita foi ${novoStatus}.`;
+    const linkWhatsApp = `https://wa.me/55${telefoneLimpo}?text=${encodeURIComponent(msgWhats)}`;
+    textoEditado += `\n[Continuar no WhatsApp](${linkWhatsApp})`;
+    
+    bot.editMessageText(textoEditado, { chat_id: message.chat.id, message_id: message.message_id, parse_mode: 'Markdown' });
+
+    if (item.Email) { // Apenas reservas terão e-mail
+        const assunto = `Sua ${tipo} na Nonna Nita foi ${novoStatus}!`;
+        const mensagemEmail = novoStatus === 'Confirmado'
+          ? `Olá ${item.Nome}, a sua ${tipo} para o dia ${item['Data da Reserva']} às ${item['Hora da Reserva']} foi CONFIRMADA! Estamos à sua espera.`
+          : `Olá ${item.Nome}, infelizmente a sua ${tipo} para o dia ${item['Data da Reserva']} às ${item['Hora da Reserva']} foi RECUSADA. Pedimos desculpas pelo inconveniente.`;
         
-        const reservaFeedbackEl = document.getElementById('reserva-feedback');
-        const pedidoFeedbackEl = document.getElementById('pedido-feedback');
-
-        if (feedbackReserva && reservaFeedbackEl) {
-            if (feedbackReserva === 'sucesso') {
-                reservaFeedbackEl.textContent = 'Solicitação de reserva enviada! Aguarde a confirmação no seu e-mail.';
-                reservaFeedbackEl.classList.add('sucesso');
-            } else if (feedbackReserva === 'erro') {
-                reservaFeedbackEl.textContent = 'Desculpe, não há mais vagas para este horário. Por favor, tente outro.';
-                reservaFeedbackEl.classList.add('erro');
-            }
-        }
-
-        if (feedbackPedido && pedidoFeedbackEl) {
-            if (feedbackPedido === 'sucesso') {
-                pedidoFeedbackEl.textContent = 'Pedido enviado para a cafetaria! Aguarde o contacto de confirmação.';
-                pedidoFeedbackEl.classList.add('sucesso');
-            }
+        try {
+          await transporter.sendMail({ from: EMAIL_FROM, to: item.Email, subject: assunto, text: mensagemEmail });
+          console.log(`E-mail de ${tipo} ${novoStatus} enviado para ${item.Email}`);
+        } catch (error) {
+          console.error(`Erro ao enviar e-mail de ${tipo}:`, error);
         }
     }
+    
+    bot.answerCallbackQuery(query.id, { text: `${tipo.charAt(0).toUpperCase() + tipo.slice(1)} ${novoStatus}!` });
+});
 
-    mostrarFeedback();
+// --- Iniciar Servidor ---
+app.listen(port, () => {
+  console.log(`Servidor rodando na porta ${port}`);
 });
 
